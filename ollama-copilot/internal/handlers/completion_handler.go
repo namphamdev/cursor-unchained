@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"text/template"
 	"time"
 
@@ -342,16 +343,35 @@ func (c *CompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				lastLineLen++
 			}
 		}
-
+		log.Printf("Sending StreamCpp request with prompt: %s", req.Prompt)
+		log.Printf("Lines: %d, LastLineLen: %d", lines, lastLineLen)
 		result, err := sendStreamCppRequest(ctx, *config, req.Prompt, languageID, int32(lines), int32(lastLineLen))
 		log.Printf("StreamCpp result: %+v", result)
 		if err == nil && result.Text != "" {
+			// Extract the last line prefix from the prompt (the incomplete line where cursor is)
+			lastNewlineIdx := strings.LastIndex(req.Prompt, "\n")
+			lastLinePrefix := ""
+			if lastNewlineIdx >= 0 {
+				lastLinePrefix = req.Prompt[lastNewlineIdx+1:]
+			} else {
+				lastLinePrefix = req.Prompt
+			}
+
+			// Find where this prefix appears in the result and return everything after it
+			responseText := result.Text
+			if lastLinePrefix != "" {
+				idx := strings.Index(result.Text, lastLinePrefix)
+				if idx != -1 {
+					responseText = result.Text[idx+len(lastLinePrefix):]
+				}
+			}
+			log.Printf("ResponseText: %s", responseText)
 			response := CompletionResponse{
 				Id:      uuid.New().String(),
 				Created: time.Now().Unix(),
 				Choices: []ChoiceResponse{
 					{
-						Text:         result.Text,
+						Text:         responseText,
 						Index:        0,
 						FinishReason: "stop",
 					},
@@ -393,6 +413,7 @@ func (c *CompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	doneChan := make(chan struct{})
 	err = c.api.Generate(r.Context(), &generate, func(resp api.GenerateResponse) error {
+		log.Printf("Completion response: %+v", resp.Response)
 		response := CompletionResponse{
 			Id:      uuid.New().String(),
 			Created: time.Now().Unix(),
