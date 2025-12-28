@@ -22,6 +22,81 @@ import (
 	"github.com/ollama/ollama/api"
 )
 
+// extractCompletion extracts only the new completion text from the result.
+// It finds the first line of the result in the prompt, calculates the overlap,
+// and returns the result text after removing the overlapping portion.
+func extractCompletion(prompt, result string) string {
+	if result == "" {
+		return ""
+	}
+
+	// Get the first line of the result
+	firstLine := result
+	if newlineIdx := strings.Index(result, "\n"); newlineIdx != -1 {
+		firstLine = result[:newlineIdx]
+	}
+
+	// Find the LAST occurrence of this first line in the prompt
+	idx := strings.LastIndex(prompt, firstLine)
+
+	// If first line not found, check if prompt's last line is a prefix of result's first line
+	if idx == -1 {
+		lastNewlineIdx := strings.LastIndex(prompt, "\n")
+		var lastPromptLine string
+		if lastNewlineIdx == -1 {
+			lastPromptLine = prompt
+		} else {
+			lastPromptLine = prompt[lastNewlineIdx+1:]
+		}
+		if strings.HasPrefix(firstLine, lastPromptLine) {
+			return result[len(lastPromptLine):]
+		}
+		return result
+	}
+
+	// Get the overlap portion from the prompt (from found index to end)
+	promptSuffix := prompt[idx:]
+
+	// Split both into lines
+	promptLines := strings.Split(promptSuffix, "\n")
+	resultLines := strings.Split(result, "\n")
+
+	// Count fully matching lines from the start
+	fullMatchCount := 0
+	for i := 0; i < len(promptLines)-1 && i < len(resultLines); i++ {
+		if promptLines[i] == resultLines[i] {
+			fullMatchCount++
+		} else {
+			break
+		}
+	}
+
+	// Calculate offset to skip fully matched lines
+	skipLen := 0
+	for i := 0; i < fullMatchCount; i++ {
+		skipLen += len(resultLines[i]) + 1 // +1 for newline
+	}
+
+	// Now handle the last (possibly partial) line from prompt
+	lastPromptLineIdx := fullMatchCount
+	if lastPromptLineIdx < len(promptLines) {
+		lastPromptLine := promptLines[lastPromptLineIdx]
+		// Check if this partial line matches the start of the corresponding result line
+		if lastPromptLineIdx < len(resultLines) {
+			resultLine := resultLines[lastPromptLineIdx]
+			if strings.HasPrefix(resultLine, lastPromptLine) {
+				skipLen += len(lastPromptLine)
+			}
+		}
+	}
+
+	if skipLen > 0 && skipLen <= len(result) {
+		return result[skipLen:]
+	}
+
+	return result
+}
+
 // CompletionRequest is the request sent to the completion handler
 type CompletionRequest struct {
 	Extra struct {
@@ -348,23 +423,7 @@ func (c *CompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		result, err := sendStreamCppRequest(ctx, *config, req.Prompt, languageID, int32(lines), int32(lastLineLen))
 		log.Printf("StreamCpp result: %+v", result)
 		if err == nil && result.Text != "" {
-			// Extract the last line prefix from the prompt (the incomplete line where cursor is)
-			lastNewlineIdx := strings.LastIndex(req.Prompt, "\n")
-			lastLinePrefix := ""
-			if lastNewlineIdx >= 0 {
-				lastLinePrefix = req.Prompt[lastNewlineIdx+1:]
-			} else {
-				lastLinePrefix = req.Prompt
-			}
-
-			// Find where this prefix appears in the result and return everything after it
-			responseText := result.Text
-			if lastLinePrefix != "" {
-				idx := strings.Index(result.Text, lastLinePrefix)
-				if idx != -1 {
-					responseText = result.Text[idx+len(lastLinePrefix):]
-				}
-			}
+			responseText := extractCompletion(req.Prompt, result.Text)
 			log.Printf("ResponseText: %s", responseText)
 			response := CompletionResponse{
 				Id:      uuid.New().String(),
@@ -392,68 +451,9 @@ func (c *CompletionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err != nil {
-			log.Printf("StreamCpp error, falling back to Ollama: %v", err)
+			log.Printf("StreamCpp error: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
 		}
-	}
-
-	// Fallback to Ollama
-	generate := api.GenerateRequest{
-		Model:  c.model,
-		Prompt: Prompt{Prefix: req.Prompt, Suffix: req.Suffix}.Generate(c.templ),
-		Options: map[string]interface{}{
-			"temperature": req.Temperature,
-			"top_p":       req.TopP,
-			"stop":        req.Stop,
-			"num_predict": c.numPredict,
-		},
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), time.Second*60)
-	r = r.WithContext(ctx)
-	defer cancel()
-	doneChan := make(chan struct{})
-	err = c.api.Generate(r.Context(), &generate, func(resp api.GenerateResponse) error {
-		log.Printf("Completion response: %+v", resp.Response)
-		response := CompletionResponse{
-			Id:      uuid.New().String(),
-			Created: time.Now().Unix(),
-			Choices: []ChoiceResponse{
-				{
-					Text:  resp.Response,
-					Index: 0,
-				},
-			},
-		}
-
-		_, err := w.Write([]byte("data: "))
-		if err != nil {
-			cancel()
-			return err
-		}
-
-		err = json.NewEncoder(w).Encode(response)
-		if err != nil {
-			cancel()
-			return err
-		}
-		if resp.Done {
-			close(doneChan)
-		}
-
-		return nil
-	})
-
-	if err == nil {
-		select {
-		case <-r.Context().Done():
-			err = r.Context().Err()
-		case <-doneChan:
-		}
-	}
-
-	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		log.Printf("error generating completion: %v", err)
-		return
 	}
 }
