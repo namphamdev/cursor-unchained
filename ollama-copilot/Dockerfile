@@ -30,7 +30,7 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/ollama-copilot .
 
 # Expose port
-EXPOSE 8080
+EXPOSE 11435 11436 11437 11438
 
 # Run the binary
 ENTRYPOINT ["./ollama-copilot"]
